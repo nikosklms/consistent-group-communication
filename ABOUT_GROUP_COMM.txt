@@ -1,0 +1,137 @@
+======================================================
+        Group Communication Layer - Περιγραφή
+======================================================
+
+Η βιβλιοθήκη αυτή υλοποιεί ένα σύστημα επικοινωνίας για ομάδες διεργασιών (clients) παρέχοντας εγγυήσεις αξιοπιστίας, αιτιακής και ολικής σειράς παράδοσης μηνυμάτων, καθώς και χειρισμό αποτυχιών μελών (failure handling) μέσω ενός πρωτοκόλλου συγχρονισμού όψης (View Synchronicity).
+
+Βασικά Συστατικά και Λειτουργίες:
+
+1.  Αρχικοποίηση (`grp_init`):
+    * Πραγματοποιεί μια μόνιμη TCP σύνδεση με μια εξωτερική Υπηρεσία Διαχείρισης Μελών (Group Membership Service - GMS).
+    * Δημιουργεί ένα global UDP socket για την επικοινωνία μεταξύ των μελών της ομάδας.
+    * Αρχικοποιεί τις δομές δεδομένων για τη διαχείριση των ομάδων.
+    * Εκκινεί τρία background threads:
+        * TCP Handler: Διαχειρίζεται την επικοινωνία με τον GMS (λήψη απαντήσεων JOIN/LEAVE, ειδοποιήσεων JOIN/LEAVE/FAIL).
+        * UDP Receiver: Ακούει στο UDP socket για μηνύματα από άλλα μέλη της ομάδας.
+        * Retransmission Thread: Ελέγχει περιοδικά για μηνύματα που δεν έχουν λάβει επιβεβαίωση (ACK) εντός ενός χρονικού ορίου και τα ξαναστέλνει.
+
+2.  Αλληλεπίδραση με GMS:
+    * Οι λειτουργίες `grp_join` και `grp_leave` στέλνουν αιτήματα στον GMS μέσω TCP.
+    * Ο `tcp_handler_func` λαμβάνει τις απαντήσεις (ACK/NACK) και τις βάζει σε μια ουρά (`GmsResponseQueue`) για να τις παραλάβουν οι `grp_join`/`grp_leave`.
+    * Ο `tcp_handler_func` λαμβάνει επίσης ειδοποιήσεις (Notifications) από τον GMS για αλλαγές στη σύνθεση της ομάδας (JOINED, LEFT, FAILED). Αυτές οι ειδοποιήσεις ενημερώνουν άμεσα την τοπική κατάσταση της ομάδας και, στην περίπτωση FAILED, ενεργοποιούν το πρωτόκολλο View Synchronicity.
+
+3.  Διαχείριση Κατάστασης Ομάδας (`group_t`):
+    * Η κεντρική δομή `group_t` κρατάει όλη την κατάσταση για μια συγκεκριμένη ομάδα:
+        * Λίστα μελών (`members`), διευθύνσεις, ports.
+        * Vector Clock (`vector_clock`) για την παρακολούθηση της αιτιακής σειράς.
+        * Αναμενόμενους τοπικούς αριθμούς ακολουθίας (`expected_recv_seq`) από κάθε μέλος.
+        * Buffers για μηνύματα εκτός σειράς (`ooo_buffer`).
+        * Buffer για "ασταθή" μηνύματα που περιμένουν global sequence number (`unstable_data_buffer`).
+        * Επόμενο global sequence number προς ανάθεση (αν είναι ο sequencer) (`next_global_seq`) και επόμενο αναμενόμενο global sequence number για παράδοση (`expected_global_seq`).
+        * Πληροφορίες για παρακολούθηση ACKs που εκκρεμούν (`pending_acks`, `vc_pending_acks`).
+        * Πληροφορίες για παρακολούθηση αιτημάτων ανάθεσης sequence number (`pending_seq_assignments`).
+        * Κατάσταση View Change (`view_change_active`, `view_change_stage`, λίστα αποτυχημένων μελών, κλπ.).
+        * Ουρά τελικής παράδοσης μηνυμάτων/ειδοποιήσεων στην εφαρμογή (`message_buffer`).
+        * Mutexes και Condition Variables για συγχρονισμό πρόσβασης στα παραπάνω δεδομένα.
+
+4.  Πρωτόκολλο Επικοινωνίας UDP:
+    * Αξιοπιστία: Χρησιμοποιεί τοπικούς αριθμούς ακολουθίας (sequence numbers) ανά αποστολέα. Κάθε μήνυμα `TYPE_DATA_UNSTABLE` και `TYPE_SEQ_ASSIGNMENT` απαιτεί ACK. Ο Retransmission thread χειρίζεται τα timeouts και τις επαναποστολές. Τα μηνύματα που φτάνουν νωρίτερα από το αναμενόμενο μπαίνουν προσωρινά στο `ooo_buffer`.
+    * Ολική Σειρά (Total Order) - Sequencer Model:
+        * Ένα μέλος (ο sequencer, με το λεξικογραφικά μικρότερο ID) είναι υπεύθυνο για την ανάθεση ενός μοναδικού, αυξανόμενου global sequence number σε κάθε μήνυμα.
+        * Όταν ένα μέλος στέλνει δεδομένα (`grp_send`):
+            1.  Στέλνει το μήνυμα ως `TYPE_DATA_UNSTABLE` με reliable multicast σε όλα τα μέλη.
+            2.  Στέλνει ένα μικρό `TYPE_SEQ_REQUEST` στον sequencer, ζητώντας global sequence number για το μήνυμα που μόλις έστειλε.
+        * Ο sequencer, όταν λάβει το `TYPE_SEQ_REQUEST`:
+            1.  Αναθέτει το επόμενο διαθέσιμο `next_global_seq`.
+            2.  Στέλνει ένα `TYPE_SEQ_ASSIGNMENT` με reliable multicast σε όλα τα μέλη, το οποίο περιέχει το αρχικό ID/seq no και το global seq no που ανατέθηκε.
+        * Οι παραλήπτες:
+            1.  Αποθηκεύουν τα `TYPE_DATA_UNSTABLE` στον `unstable_data_buffer`.
+            2.  Όταν λάβουν το αντίστοιχο `TYPE_SEQ_ASSIGNMENT`, αντιστοιχίζουν το global seq no στο μήνυμα στον unstable buffer. Αν τα δεδομένα δεν έχουν φτάσει ακόμα, δημιουργείται ένας "placeholder" στον unstable buffer.
+            3.  Η παράδοση στην εφαρμογή (`grp_recv`) γίνεται με βάση το `expected_global_seq`. Μόνο όταν ένα μήνυμα έχει λάβει το global seq του ΚΑΙ αυτός ο αριθμός είναι ο επόμενος αναμενόμενος, παραδίδεται.
+    * Αιτιακή Σειρά (Causal Order): Χρησιμοποιούνται Vector Clocks. Κάθε μήνυμα `TYPE_DATA_UNSTABLE` μεταφέρει το Vector Clock του αποστολέα τη στιγμή της αποστολής. Ένας παραλήπτης ελέγχει αν το μήνυμα είναι αιτιακά έτοιμο συγκρίνοντας το VC του μηνύματος με το τοπικό του VC. Αν όχι, το μήνυμα μπαίνει σε buffer (unstable) και παραδίδεται αργότερα όταν ικανοποιηθεί η αιτιακή συνθήκη (και η συνθήκη ολικής σειράς). Ο τελικός αιτιακός έλεγχος γίνεται ακριβώς πριν την παράδοση από τον `try_deliver_totally_ordered` ή τον `process_stable_messages_for_delivery`.
+
+5.  Χειρισμός Αποτυχιών & View Synchronicity:
+    * Μια αποτυχία μέλους ανιχνεύεται είτε μέσω ειδοποίησης `NOTIFY_MEMBER_FAILED` από τον GMS, είτε αν λήξει ο χρόνος αναμονής για ACK ενός μηνύματος ελέγχου του View Change (`TYPE_VIEW_CHANGE_*`).
+    * Όταν ανιχνευτεί μια (νέα) αποτυχία:
+        1.  Επιλέγεται ένας Συντονιστής (Coordinator - το μέλος με το μικρότερο ID από τους εναπομείναντες).
+        2.  Αν είμαι ο Coordinator, στέλνω `TYPE_VIEW_CHANGE_START` (αναφέροντας το μέλος που απέτυχε) στους υπόλοιπους.
+        3.  Όλα τα μέλη (που λαμβάνουν το START ή το RESTART) στέλνουν την κατάστασή τους (κυρίως το `expected_global_seq`) στον Coordinator με μήνυμα `TYPE_VIEW_CHANGE_STATE`.
+        4.  Ο Coordinator περιμένει να λάβει state από όλους τους υπόλοιπους ενεργούς. Υπολογίζει το μέγιστο `expected_global_seq` που θα παραδοθεί σε αυτή την "όψη" (view) - αυτό είναι το `agreed_delivery_gseq`.
+        5.  Ο Coordinator στέλνει `TYPE_VIEW_CHANGE_CONFIRM` σε όλους, περιέχοντας το `agreed_delivery_gseq`.
+        6.  Όλα τα μέλη (που λαμβάνουν το CONFIRM, ή ο coordinator αμέσως μετά την αποστολή του) παραδίδουν όλα τα μηνύματα από τον unstable buffer τους μέχρι και το `agreed_delivery_gseq` (`process_stable_messages_for_delivery`).
+        7.  Μετά την παράδοση, καλείται η `finalize_failed_view_generalized` που αφαιρεί οριστικά τα αποτυχημένα μέλη από τη λίστα, ενημερώνει τα pending ACKs, και βάζει την ειδοποίηση FAILED στην ουρά για την εφαρμογή.
+    * Αποτυχία Συντονιστή: Αν ο τρέχων Coordinator αποτύχει κατά τη διάρκεια του View Change, ανιχνεύεται και επιλέγεται νέος Coordinator (C'). Ο C' στέλνει `TYPE_VIEW_CHANGE_RESTART` στους υπόλοιπους, περιέχοντας τη *συνολική* λίστα των μελών που έχουν αποτύχει μέχρι στιγμής σε αυτό το VC instance, και η διαδικασία συλλογής state ξεκινά ξανά.
+    * Τα μηνύματα ελέγχου του View Change (`START`, `STATE`, `CONFIRM`, `RESTART`) στέλνονται αξιόπιστα (απαιτούν `TYPE_VIEW_CHANGE_ACK`).
+
+6.  Μεταφορά Κατάστασης (`State Transfer`): Όταν ένα νέο μέλος κάνει `grp_join`, αφού πάρει τη λίστα μελών από τον GMS, στέλνει `TYPE_STATE_REQUEST` σε ένα υπάρχον μέλος (συνήθως τον τρέχοντα sequencer) για να πάρει την τρέχουσα κατάσταση (κυρίως το `expected_global_seq` και το Vector Clock) και να συγχρονιστεί.
+
+7.  API (`grp_send`, `grp_recv`): Παρέχει τις βασικές συναρτήσεις για αποστολή μηνυμάτων και λήψη μηνυμάτων δεδομένων ή ειδοποιήσεων με τις εγγυήσεις που προσφέρει η βιβλιοθήκη.
+
+8.  Τερματισμός (`grp_shutdown`): Σταματά τα threads, κλείνει συνδέσεις και sockets, και απελευθερώνει τους πόρους (mutexes, condition variables, μνήμη).
+
+
+---
+
+**Τύποι και Δομή Μηνυμάτων Πρωτοκόλλου UDP Group**
+
+Τα παρακάτω μηνύματα ανταλλάσσονται μεταξύ των clients μέσω UDP για την επικοινωνία εντός της ομάδας.
+
+* **Κοινή Κεφαλίδα (Περίπου):** Τα περισσότερα μηνύματα ξεκινούν με:
+    * `Type` (1 byte): Ο τύπος του μηνύματος (π.χ., 110 για `TYPE_DATA_UNSTABLE`).
+    * `GroupLen` (1 byte): Το μήκος του ονόματος της ομάδας.
+    * `GroupName` (GroupLen bytes): Το όνομα της ομάδας.
+    * `SenderLen` (1 byte): Το μήκος του ID του αποστολέα αυτού του UDP πακέτου.
+    * `SenderID` (SenderLen bytes): Το ID του αποστολέα αυτού του UDP πακέτου.
+
+* **TYPE_DATA_UNSTABLE (110):**
+    * Κοινή Κεφαλίδα (όπως πάνω - SenderID είναι ο αρχικός αποστολέας των δεδομένων).
+    * `LocalSeq` (4 bytes, network byte order): Ο τοπικός αριθμός ακολουθίας του αποστολέα για αυτό το μήνυμα.
+    * `VectorClock` (MAX_MEMBERS * 4 bytes, network byte order): Το Vector Clock του αποστολέα τη στιγμή της αποστολής.
+    * `Payload` (υπόλοιπα bytes): Τα δεδομένα της εφαρμογής.
+
+* **TYPE_SEQ_REQUEST (111):**
+    * Κοινή Κεφαλίδα (SenderID είναι ο αρχικός αποστολέας των δεδομένων που ζητάει GSeq).
+    * `OriginalLocalSeq` (4 bytes, network byte order): Ο τοπικός αριθμός ακολουθίας του `TYPE_DATA_UNSTABLE` για το οποίο ζητείται GSeq.
+
+* **TYPE_SEQ_ASSIGNMENT (112):**
+    * Κοινή Κεφαλίδα (SenderID είναι ο *Sequencer*).
+    * `OrigSenderLen` (1 byte): Μήκος του ID του αρχικού αποστολέα.
+    * `OrigSenderID` (OrigSenderLen bytes): ID του αρχικού αποστολέα του `TYPE_DATA_UNSTABLE`.
+    * `OrigLocalSeq` (4 bytes, network byte order): Ο τοπικός αριθμός ακολουθίας του αρχικού `TYPE_DATA_UNSTABLE`.
+    * `GlobalSeq` (8 bytes, network byte order - big endian): Ο global sequence number που ανατέθηκε.
+
+* **TYPE_ACK (101):**
+    * Κοινή Κεφαλίδα (SenderID είναι αυτός που στέλνει το ACK).
+    * `AckedType` (1 byte): Ο τύπος του μηνύματος που επιβεβαιώνεται (110 για `DATA_UNSTABLE` ή 112 για `SEQ_ASSIGNMENT`).
+    * `AckSeq` (4 bytes, network byte order): Ο *τοπικός* αριθμός ακολουθίας του μηνύματος που επιβεβαιώνεται.
+
+* **TYPE_STATE_REQUEST (113):**
+    * Κοινή Κεφαλίδα (SenderID είναι το νέο μέλος που ζητάει state).
+    * (Δεν έχει επιπλέον πεδία μετά το SenderID).
+
+* **TYPE_STATE_RESPONSE (114):**
+    * Κοινή Κεφαλίδα (SenderID είναι το μέλος που στέλνει την κατάστασή του).
+    * `ExpectedGlobalSeq` (8 bytes, network byte order - big endian): Το `expected_global_seq` του αποστολέα.
+    * `VectorClock` (MAX_MEMBERS * 4 bytes, network byte order): Το Vector Clock του αποστολέα.
+
+* **TYPE_VIEW_CHANGE_START (120):**
+    * Κοινή Κεφαλίδα (SenderID είναι ο Coordinator).
+    * `FailedIDLen` (1 byte): Μήκος του ID του (πρώτου) μέλους που απέτυχε.
+    * `FailedID` (FailedIDLen bytes): ID του μέλους που απέτυχε.
+
+* **TYPE_VIEW_CHANGE_STATE (121):**
+    * Κοινή Κεφαλίδα (SenderID είναι το μέλος που στέλνει την κατάστασή του).
+    * `ReportedExpectedGSeq` (8 bytes, network byte order - big endian): Το `expected_global_seq` του μέλους.
+
+* **TYPE_VIEW_CHANGE_CONFIRM (122):**
+    * Κοινή Κεφαλίδα (SenderID είναι ο Coordinator).
+    * `AgreedGSeq` (8 bytes, network byte order - big endian): Το συμφωνημένο global sequence number μέχρι το οποίο θα παραδοθούν μηνύματα.
+
+* **TYPE_VIEW_CHANGE_ACK (123):**
+    * Κοινή Κεφαλίδα (SenderID είναι αυτός που στέλνει το ACK).
+    * `AckedMsgType` (1 byte): Ο τύπος του μηνύματος View Change που επιβεβαιώνεται (120, 121, 122, ή 124).
+
+* **TYPE_VIEW_CHANGE_RESTART (124):**
+    * Κοινή Κεφαλίδα (SenderID είναι ο *νέος* Coordinator).
+    * `FailedCount` (1 byte): Πόσα μέλη έχουν αποτύχει *συνολικά* σε αυτό το view change instance.
+    * `[FailedID_i_Len(1) + FailedID_i(...)] * FailedCount`: Για κάθε αποτυχημένο μέλος, το μήκος του ID του και το ίδιο το ID.

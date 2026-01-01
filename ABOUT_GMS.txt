@@ -1,0 +1,114 @@
+==============================
+        GMS - Περιγραφή
+==============================
+
+Ο παρών κώδικας του GMS υλοποιεί την Υπηρεσία Διαχείρισης Μελών (Group Membership Service - GMS). Ο ρόλος του GMS είναι να λειτουργεί ως κεντρικό σημείο συντονισμού για τη δημιουργία ομάδων, την είσοδο (join) και έξοδο (leave) μελών από αυτές, καθώς και την ανίχνευση και ειδοποίηση για αποτυχίες (failures) μελών.
+
+Βασικά Συστατικά και Λειτουργίες:
+
+1.  Αρχιτεκτονική Εξυπηρετητή (Server):
+    * Βασίζεται σε μοντέλο "Thread-Per-Client". Ένα κύριο thread (`receiver_thread_func`) δέχεται νέες συνδέσεις TCP από clients.
+    * Για κάθε νέα σύνδεση client, δημιουργείται ένα ξεχωριστό thread (`handle_client_thread_entry`) που αναλαμβάνει την επικοινωνία αποκλειστικά με αυτόν τον client.
+    * Χρησιμοποιεί TCP για την επικοινωνία με τους clients (λήψη αιτημάτων, αποστολή απαντήσεων και ειδοποιήσεων).
+
+2.  Αποθήκευση Δεδομένων (Hash Table):
+    * Η κύρια δομή δεδομένων είναι ένας Hash Table (`hash_table_t`) που αποθηκεύει τις ομάδες.
+    * Κάθε είσοδος στον πίνακα αντιστοιχεί σε μια ομάδα (`group_node_t`), η οποία περιέχει το όνομα της ομάδας και μια συνδεδεμένη λίστα με τα μέλη της (`member_node_t`).
+    * Κάθε κόμβος μέλους (`member_node_t`) περιέχει τις πληροφορίες για ένα μέλος (`member_t`), όπως το ID του, τη διεύθυνση UDP του, το file descriptor της TCP σύνδεσής του με τον GMS, και τη χρονική σήμανση του τελευταίου PONG που έλαβε.
+    * Ο Hash Table υποστηρίζει δυναμική αλλαγή μεγέθους (resizing) για να διατηρεί καλή απόδοση. Η πρόσβαση στον πίνακα προστατεύεται από ένα mutex (`pthread_mutex_t`) για ασφάλεια σε πολυνηματικό περιβάλλον.
+
+3.  Διαχείριση Client (`handle_client_thread_entry`):
+    * Κάθε τέτοιο thread λαμβάνει μηνύματα από τον συνδεδεμένο client:
+        * `MSG_TYPE_JOIN`: Ο client ζητά να μπει σε μια ομάδα. Το thread ελέγχει αν το ID υπάρχει ήδη, προσθέτει το μέλος στον hash table (`add_to_group`), στέλνει απάντηση (`RESP_ACK_SUCCESS` με τη λίστα των *άλλων* μελών ή NACK) και ειδοποιεί τα υπόλοιπα μέλη της ομάδας για τη νέα άφιξη.
+        * `MSG_TYPE_LEAVE`: Ο client ζητά να φύγει από μια ομάδα. Το thread αφαιρεί το μέλος από τον hash table (`rmv_from_group`), στέλνει απάντηση (`RESP_ACK_SUCCESS` ή NACK) και ειδοποιεί τα υπόλοιπα μέλη.
+        * `MSG_TYPE_PONG`: Απάντηση του client σε PING από τον GMS. Το thread ενημερώνει το `last_pong_time` για *όλες* τις εγγραφές μέλους που αντιστοιχούν στο TCP file descriptor αυτού του client (σε περίπτωση που ο client ανήκει σε πολλαπλές ομάδες).
+    * Σε περίπτωση αποσύνδεσης ή σφάλματος λήψης (`recv`), το thread καλεί τη συνάρτηση χειρισμού αποτυχίας (`handle_member_failure`).
+
+4.  Ασύγχρονη Αποστολή (Sender Thread & Queue):
+    * Για να μην μπλοκάρουν τα client handler threads περιμένοντας την αποστολή δεδομένων, χρησιμοποιείται μια ουρά αποστολής (`send_queue_t`) και ένα ειδικό thread (`sender_thread_func`).
+    * Οι συναρτήσεις αποστολής (π.χ., `send_join_response`, `send_notification`) απλώς προσθέτουν το μήνυμα και τον παραλήπτη (fd) στην ουρά.
+    * Το sender thread αφαιρεί στοιχεία από την ουρά και πραγματοποιεί την αποστολή (`send`) στο σωστό file descriptor.
+
+5.  Έλεγχος Ζωντάνιας (Liveness Thread):
+    * Ένα thread (`liveness_thread_func`) εκτελείται περιοδικά (κάθε `LIVENESS_CHECK_INTERVAL` δευτερόλεπτα).
+    * Στέλνει ένα μήνυμα `MSG_TYPE_PING` σε κάθε *μοναδική* ενεργή TCP σύνδεση client *μία φορά* ανά κύκλο.
+    * Ελέγχει αν έχει περάσει ο χρόνος `LIVENESS_TIMEOUT` από το `last_pong_time` κάθε μέλους.
+    * Αν εντοπιστεί timeout για έναν client (δηλαδή για ένα συγκεκριμένο `tcp_client_fd`), καλείται η `handle_member_failure`.
+
+6.  Χειρισμός Αποτυχίας (`handle_member_failure`):
+    * Καλείται είτε λόγω timeout από το liveness thread, είτε λόγω προβλήματος στη σύνδεση TCP στο `handle_client_thread_entry`.
+    * Αφαιρεί *όλες* τις εγγραφές του μέλους που αντιστοιχούν στο προβληματικό `tcp_client_fd` από *όλες* τις ομάδες στις οποίες ανήκε.
+    * Ειδοποιεί τα εναπομείναντα μέλη των επηρεαζόμενων ομάδων με μήνυμα `NOTIFY_MEMBER_FAILED`.
+    * Κλείνει το TCP socket (`close`) του αποτυχημένου client.
+
+7.  Τερματισμός:
+    * Ο server θεωρούμε, σύμφωνα με την εκφώνηση, πως δεν αποτυγχάνει ποτέ.
+    * Η σημαία `terminate_server` ενημερώνει τα threads.
+    * Το κύριο thread περιμένει τα threads να ολοκληρώσουν, κλείνει το listening socket και απελευθερώνει τις δομές δεδομένων (hash table, sender queue).
+
+
+---
+
+Τύποι και Δομή Μηνυμάτων GMS (TCP)
+
+Τα παρακάτω μηνύματα ανταλλάσσονται μεταξύ των clients και του GMS μέσω της μόνιμης TCP σύνδεσης.
+
+**Μηνύματα που λαμβάνει ο GMS από τον Client:**
+
+* `MSG_TYPE_JOIN (0)`:
+    * `Type` (1 byte = 0)
+    * `IDLen` (1 byte): Μήκος του Member ID.
+    * `GroupLen` (1 byte): Μήκος του Group Name.
+    * `UDPPort` (2 bytes, network byte order): Η UDP πόρτα του client.
+    * `MemberID` (IDLen bytes): Το ID του client.
+    * `GroupName` (GroupLen bytes): Το όνομα της ομάδας.
+
+* `MSG_TYPE_LEAVE (1)`:
+    * `Type` (1 byte = 1)
+    * `IDLen` (1 byte): Μήκος του Member ID.
+    * `GroupLen` (1 byte): Μήκος του Group Name.
+    * `MemberID` (IDLen bytes): Το ID του client που φεύγει.
+    * `GroupName` (GroupLen bytes): Το όνομα της ομάδας.
+
+* `MSG_TYPE_PONG (2)`:
+    * `Type` (1 byte = 2)
+    * (Δεν έχει άλλα δεδομένα).
+
+**Μηνύματα που στέλνει ο GMS στον Client:**
+
+* `RESP_ACK_SUCCESS (0)` (Απάντηση σε επιτυχές JOIN):
+    * `Type` (1 byte = 0)
+    * `NumOtherMembers` (2 bytes, network byte order): Πλήθος *άλλων* μελών στην ομάδα.
+    * Για κάθε άλλο μέλος (επανάληψη `NumOtherMembers` φορές):
+        * `MemberIP` (4 bytes, network byte order): Η IPv4 διεύθυνση του μέλους.
+        * `MemberUDPPort` (2 bytes, network byte order): Η UDP πόρτα του μέλους.
+        * `MemberIDLen` (1 byte): Το μήκος του ID του μέλους.
+        * `MemberID` (MemberIDLen bytes): Το ID του μέλους.
+
+* `RESP_ACK_SUCCESS (0)` (Απάντηση σε επιτυχές LEAVE):
+    * `Type` (1 byte = 0)
+    * (Αποτελείται μόνο από το byte τύπου).
+
+* NACK Responses (Τύποι 1, 2, 3, 4, 5):
+    * `Type` (1 byte = 1 έως 5): Ο τύπος του NACK.
+    * `ErrorMsgLen` (1 byte): Μήκος του μηνύματος λάθους.
+    * `ErrorMsg` (ErrorMsgLen bytes): Περιγραφή του λάθους (string).
+
+* `NOTIFY_MEMBER_JOINED (10)`:
+    * `Type` (1 byte = 10)
+    * `GroupLen` (1 byte): Μήκος του ονόματος της ομάδας.
+    * `GroupName` (GroupLen bytes): Το όνομα της ομάδας.
+    * `MemberIDLen` (1 byte): Μήκος του ID του νέου μέλους.
+    * `MemberID` (MemberIDLen bytes): ID του νέου μέλους.
+    * `MemberIP` (4 bytes, network byte order): IP του νέου μέλους.
+    * `MemberUDPPort` (2 bytes, network byte order): UDP πόρτα του νέου μέλους.
+
+* `NOTIFY_MEMBER_LEFT (11)`:
+    * Ίδια δομή με το `NOTIFY_MEMBER_JOINED`, αλλά με `Type` = 11 και αναφέρεται στο μέλος που έφυγε.
+
+* `NOTIFY_MEMBER_FAILED (12)`:
+    * Ίδια δομή με το `NOTIFY_MEMBER_JOINED`, αλλά με `Type` = 12 και αναφέρεται στο μέλος που απέτυχε.
+
+* `MSG_TYPE_PING (20)`:
+    * `Type` (1 byte = 20)
+    * (Δεν έχει άλλα δεδομένα).
