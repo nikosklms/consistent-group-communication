@@ -1,4 +1,4 @@
-# Reliable Group Communication
+# Consistent Group Communication
 
 ## Overview
 
