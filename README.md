@@ -1,4 +1,4 @@
-# Group Membership Service (GMS) & Reliable Group Communication
+# Reliable Group Communication
 
 ## Overview
 
